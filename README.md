@@ -9,6 +9,7 @@ A curated collection of open source projects under TuyaOpen, dedicated to buildi
 | Tuya T5 Pocket AI | Portable Handheld Console of AI-Agent Prototyping | AI-Agent, IoT, Open-Hardware | [Repo](https://github.com/tuya/TuyaOpen/tree/master/apps/tuya_t5_pocket) | [TuyaOpen](https://github.com/tuya) | EN/CN | 
 | Tuya T5 Pixel | 32x32 Pixel Art LED NeoPixels | AI-Agent, IoT, Open-Hardware | [Repo](https://github.com/tuya/TuyaOpen/tree/master/apps/tuya_t5_pixel) | [TuyaOpen](https://github.com/tuya) | EN/CN |
 | Tuya T5 e-Paper Album | A colorful ink photo album based on TuyaOpen | AI-Agent, IoT, Open-Hardware, E-INK, Local-Server | [e-Paper-Album](https://github.com/HonestQiao/e-Paper-Album/) | [HonestQiao](https://github.com/HonestQiao) | CN |
+| Tuya T5 Eaten Pizza | A focus app for a 1.69inch circular E6 eink display | IoT, Open-Hardware, E-INK, E6-waveform | [Eaten Pizza](https://github.com/HPC2H2/Tuya_EatenPizza) | [HPC2H2](https://github.com/HPC2H2/) | CN |
 
 
 ## Contribution Guidelines
