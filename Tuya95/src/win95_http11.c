@@ -204,8 +204,7 @@ STATIC OPERATE_RET __http11_request_once(CONST CHAR_T *method,
         }
     } else {
         TUYA_IP_ADDR_T addr = 0;
-        if (tal_net_gethostbyname(host, &addr) != OPRT_OK || addr == 0) {
-            PR_ERR("HTTP11: DNS failed for %s", host);
+        if (win95_dns_resolve(host, &addr) != OPRT_OK || addr == 0) {
             return OPRT_COM_ERROR;
         }
         io.fd = tal_net_socket_create(PROTOCOL_TCP);

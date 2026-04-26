@@ -64,6 +64,13 @@ OPERATE_RET win95_http10_parse_url(CONST CHAR_T *url,
                                     UINT16_T *port_out,
                                     CHAR_T *path_buf, UINT32_T path_cap);
 
+/**
+ * @brief Thread-safe DNS resolver (uses lwip_gethostbyname_r with stack buffers).
+ *        Returns OPRT_OK and sets *addr (host byte order) on success.
+ */
+OPERATE_RET win95_dns_resolve(CONST CHAR_T *host, TUYA_IP_ADDR_T *addr);
+
+
 #ifdef __cplusplus
 }
 #endif

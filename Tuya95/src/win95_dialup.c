@@ -337,6 +337,7 @@ STATIC VOID_T __du_poll_cb(lv_timer_t *timer)
         lv_label_set_text(s_du.status_lbl, buf);
         lv_obj_set_style_text_color(s_du.status_lbl, lv_color_hex(0x00AA00), 0);
         win95_taskbar_set_net(TRUE);
+        win95_pairing_save_wifi(app->wifi_ssid, app->wifi_pass);
         lv_timer_delete(s_du.poll_tmr);
         s_du.poll_tmr = NULL;
         return;

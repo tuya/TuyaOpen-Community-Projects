@@ -20,6 +20,56 @@
 #define HTTP_HEADER_MAX     4096
 
 /* ---------------------------------------------------------------------------
+ * Thread-safe DNS resolver
+ *
+ * lwip_gethostbyname() (used by tal_net_gethostbyname) stores its result in
+ * static-storage locals (LWIP_DNS_API_HOSTENT_STORAGE=0 in lwipopts.h), so
+ * a concurrent call from a Tuya SDK background thread overwrites the buffer
+ * and returns a wrong IP → connect fails → OPRT_SOCK_CONN_ERR (-13).
+ *
+ * lwip_gethostbyname_r() writes into CALLER-provided buffers, making it
+ * fully thread-safe.  The function is already compiled into the firmware via
+ * lwip/src/api/netdb.c; we forward-declare it here using a minimal equivalent
+ * of struct hostent (same binary layout — 5 pointer/int fields, POSIX standard)
+ * to avoid pulling in the lwIP src/include path that is not exposed to app code.
+ * --------------------------------------------------------------------------- */
+typedef struct {
+    char  *h_name;
+    char **h_aliases;
+    int    h_addrtype;
+    int    h_length;
+    char **h_addr_list;
+} w95_hostent_t;
+
+extern int lwip_gethostbyname_r(const char *name,
+                                 w95_hostent_t *ret, char *buf, UINT32_T buflen,
+                                 w95_hostent_t **result, int *h_errnop);
+
+OPERATE_RET win95_dns_resolve(CONST CHAR_T *host, TUYA_IP_ADDR_T *addr)
+{
+    w95_hostent_t  he_buf;
+    CHAR_T         strbuf[384];
+    w95_hostent_t *result = NULL;
+    INT32_T        herr   = 0;
+
+    if (lwip_gethostbyname_r(host, &he_buf, strbuf, (UINT32_T)sizeof(strbuf),
+                              &result, &herr) != 0 ||
+        result == NULL ||
+        result->h_addr_list == NULL ||
+        result->h_addr_list[0] == NULL) {
+        PR_ERR("DNS failed for %s (h_errno=%d)", host, herr);
+        return OPRT_COM_ERROR;
+    }
+    /* Network-byte-order → TUYA_IP_ADDR_T (host byte order), no ntohl needed:
+     * manually reconstruct so we don't need lwip/inet.h. */
+    CONST UINT8_T *p = (CONST UINT8_T *)result->h_addr_list[0];
+    *addr = ((TUYA_IP_ADDR_T)p[0] << 24) | ((TUYA_IP_ADDR_T)p[1] << 16) |
+            ((TUYA_IP_ADDR_T)p[2] <<  8) |  (TUYA_IP_ADDR_T)p[3];
+    PR_DEBUG("DNS %s -> %u.%u.%u.%u", host, p[0], p[1], p[2], p[3]);
+    return OPRT_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Function implementations
  * --------------------------------------------------------------------------- */
 /**
@@ -266,8 +316,7 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
     out->body_buf_cap = ext_cap;
 
     TUYA_IP_ADDR_T addr = 0;
-    if (tal_net_gethostbyname(host, &addr) != OPRT_OK || addr == 0) {
-        PR_ERR("DNS failed for %s", host);
+    if (win95_dns_resolve(host, &addr) != OPRT_OK || addr == 0) {
         return OPRT_COM_ERROR;
     }
 
@@ -286,7 +335,17 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
         return OPRT_SOCK_CONN_ERR;
     }
 
-    /* Build + send the request. */
+    /* Build + send the request.
+     * Include port in Host for non-standard ports (RFC 7230 §5.4); some
+     * servers / reverse-proxies reject requests that omit it, returning an
+     * empty body which then triggers the HTTP/1.1 fallback and a DNS race. */
+    CHAR_T host_hdr[WIN95_HTTP_HOST_MAX + 8];
+    if (port == 80) {
+        strncpy(host_hdr, host, sizeof(host_hdr) - 1);
+        host_hdr[sizeof(host_hdr) - 1] = '\0';
+    } else {
+        snprintf(host_hdr, sizeof(host_hdr), "%s:%u", host, (UINT32_T)port);
+    }
     CHAR_T req[512];
     INT32_T n = snprintf(req, sizeof(req),
         "GET %s HTTP/1.0\r\n"
@@ -295,7 +354,7 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
         "Accept: text/html, text/plain, */*\r\n"
         "Connection: close\r\n"
         "\r\n",
-        path, host);
+        path, host_hdr);
     if (n <= 0 || n >= (INT32_T)sizeof(req)) {
         __sock_close(fd);
         return OPRT_COM_ERROR;
