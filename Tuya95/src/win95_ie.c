@@ -67,8 +67,8 @@ typedef struct {
     BOOL_T secure;
 } IE_COOKIE_T;
 
-/* Per-image fetch slot */
-#define IE_IMG_MAX  WIN95_HTML_MAX_IMGS
+/* Per-image fetch slot — cap at 4 to bound static RAM */
+#define IE_IMG_MAX  4
 typedef struct {
     lv_obj_t           *widget;    /* placeholder object (NULL = slot free) */
     volatile BOOL_T     done;
@@ -125,6 +125,11 @@ typedef struct {
 /* ---------------------------------------------------------------------------
  * File scope variables
  * --------------------------------------------------------------------------- */
+/* Static HTTP body buffers placed in PSRAM — no runtime tal_malloc, no fragmentation.
+ * page: 20 KB for page HTML; img: 8 KB × 4 for inline images. */
+STATIC __attribute__((section(".psram.bss"))) CHAR_T s_ie_page_buf[WIN95_HTTP_PAGE_BUF_MAX];
+STATIC __attribute__((section(".psram.bss"))) CHAR_T s_ie_img_buf[IE_IMG_MAX][WIN95_HTTP_IMG_BODY_MAX];
+
 STATIC IE_CTX_T s_ie;
 
 /* ---------------------------------------------------------------------------
@@ -534,10 +539,9 @@ STATIC VOID_T __ie_start_img_fetches(VOID_T)
      * leave them alone to avoid a use-after-free race with the running thread. */
     for (INT32_T i = 0; i < IE_IMG_MAX; i++) {
         if (s_ie.img_slots[i].thread == NULL) {
-            CHAR_T *saved_prebuf = s_ie.img_slots[i].img_prebuf;
             win95_http10_free(&s_ie.img_slots[i].resp);
             memset(&s_ie.img_slots[i], 0, sizeof(IE_IMG_SLOT_T));
-            s_ie.img_slots[i].img_prebuf = saved_prebuf;
+            s_ie.img_slots[i].img_prebuf = s_ie_img_buf[i];
         }
     }
     if (s_ie.img_poll_tmr) {
@@ -817,10 +821,9 @@ STATIC VOID_T __ie_navigate_request(CONST CHAR_T *raw_url, BOOL_T push_history,
     for (INT32_T i = 0; i < IE_IMG_MAX; i++) {
         s_ie.img_slots[i].widget = NULL;
         if (s_ie.img_slots[i].thread == NULL) {
-            CHAR_T *saved_prebuf = s_ie.img_slots[i].img_prebuf;
             win95_http10_free(&s_ie.img_slots[i].resp);
             memset(&s_ie.img_slots[i], 0, sizeof(IE_IMG_SLOT_T));
-            s_ie.img_slots[i].img_prebuf = saved_prebuf;
+            s_ie.img_slots[i].img_prebuf = s_ie_img_buf[i];
         }
     }
     /* Free any page body that load_poll hasn't consumed yet (prevents stale-resp leak). */
@@ -988,16 +991,10 @@ STATIC VOID_T __ie_close(VOID_T)
     }
     for (INT32_T i = 0; i < IE_IMG_MAX; i++) {
         win95_http10_free(&s_ie.img_slots[i].resp);
-        if (s_ie.img_slots[i].img_prebuf) {
-            tal_free(s_ie.img_slots[i].img_prebuf);
-            s_ie.img_slots[i].img_prebuf = NULL;
-        }
+        /* img_prebuf points into static s_ie_img_buf — do not free */
     }
     win95_http10_free(&s_ie.resp);
-    if (s_ie.page_prebuf) {
-        tal_free(s_ie.page_prebuf);
-        s_ie.page_prebuf = NULL;
-    }
+    /* page_prebuf points into static s_ie_page_buf — do not free */
     if (s_ie.screen) {
         lv_obj_delete(s_ie.screen);
     }
@@ -1036,11 +1033,11 @@ VOID_T win95_ie_open(VOID_T)
     }
     memset(&s_ie, 0, sizeof(IE_CTX_T));
 
-    /* Pre-allocate HTTP body buffers while heap is clean and unfragmented. */
-    s_ie.page_prebuf = (CHAR_T *)tal_malloc(WIN95_HTTP_PAGE_BUF_MAX);
-    s_ie.page_prebuf_cap = s_ie.page_prebuf ? WIN95_HTTP_PAGE_BUF_MAX : 0;
+    /* Wire pre-allocated static body buffers — no runtime heap allocation. */
+    s_ie.page_prebuf = s_ie_page_buf;
+    s_ie.page_prebuf_cap = WIN95_HTTP_PAGE_BUF_MAX;
     for (INT32_T i = 0; i < IE_IMG_MAX; i++) {
-        s_ie.img_slots[i].img_prebuf = (CHAR_T *)tal_malloc(WIN95_HTTP_IMG_BODY_MAX);
+        s_ie.img_slots[i].img_prebuf = s_ie_img_buf[i];
     }
 
     s_ie.screen = lv_obj_create(lv_scr_act());

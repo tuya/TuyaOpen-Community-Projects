@@ -705,13 +705,19 @@ STATIC VOID_T __clock_cb(lv_timer_t *timer)
     }
     win95_pipes_tick();  /* advance idle counter; starts screensaver when timeout reached */
 
-    BOOL_T connected = (app->wifi_state == WIFI_ST_CONNECTED);
+    BOOL_T connected = (app->wifi_state == WIFI_ST_CONNECTED) ||
+                       (app->pair_state == PAIR_ST_MQTT_CONNECTED);
     if (s_w95.net_ico1) {
         if (connected) {
             lv_obj_clear_flag(s_w95.net_ico1, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(s_w95.net_ico1, LV_OBJ_FLAG_HIDDEN);
         }
+    }
+
+    /* Trigger NTP sync every 60 s while online and not yet synced. */
+    if (connected && !win95_ntp_synced() && (s_w95.uptime % 60 == 1)) {
+        win95_ntp_trigger();
     }
 }
 

@@ -199,6 +199,15 @@ STATIC HTML_FORM_T            s_forms[WIN95_HTML_FORM_MAX];
 STATIC UINT32_T               s_dom_count;
 STATIC UINT32_T               s_form_count;
 
+/* Static href pool — avoids lv_malloc per link (never freed by LVGL on delete) */
+#define HREF_POOL_MAX  64
+#define HREF_URL_MAX   256
+STATIC __attribute__((section(".psram.bss"))) CHAR_T   s_href_pool[HREF_POOL_MAX][HREF_URL_MAX];
+STATIC UINT32_T  s_href_pool_idx = 0;
+
+/* Static inline accumulation buffer — avoids per-render tal_malloc */
+STATIC __attribute__((section(".psram.bss"))) CHAR_T   s_inline_buf[INLINE_BUF_MAX];
+
 /* ---------------------------------------------------------------------------
  * Forward declarations
  * --------------------------------------------------------------------------- */
@@ -650,12 +659,12 @@ STATIC VOID_T __emit_link(HTML_CTX_T *ctx, CONST CHAR_T *text, CONST CHAR_T *hre
     lv_obj_t *l = __make_label(ctx->container, text, &lv_font_unscii_8, lcolor);
     lv_obj_set_style_text_decor(l, LV_TEXT_DECOR_UNDERLINE, 0);
     lv_obj_add_flag(l, LV_OBJ_FLAG_CLICKABLE);
-    UINT32_T hlen = (UINT32_T)strlen(href);
-    CHAR_T *dup = (CHAR_T *)lv_malloc(hlen + 1);
-    if (dup) {
-        memcpy(dup, href, hlen);
-        dup[hlen] = '\0';
-        lv_obj_add_event_cb(l, __link_clicked_cb, LV_EVENT_CLICKED, dup);
+    if (href && href[0] && s_href_pool_idx < HREF_POOL_MAX) {
+        strncpy(s_href_pool[s_href_pool_idx], href, HREF_URL_MAX - 1);
+        s_href_pool[s_href_pool_idx][HREF_URL_MAX - 1] = '\0';
+        lv_obj_add_event_cb(l, __link_clicked_cb, LV_EVENT_CLICKED,
+                            s_href_pool[s_href_pool_idx]);
+        s_href_pool_idx++;
     }
     __apply_box_style(ctx, l);
     __register_current_widget(ctx, l, "a", text, FALSE);
@@ -2343,6 +2352,7 @@ STATIC OPERATE_RET __render_html(lv_obj_t *container, CONST CHAR_T *html,
         memset(s_forms, 0, sizeof(s_forms));
         s_dom_count = 0;
         s_form_count = 0;
+        s_href_pool_idx = 0;
         memset(&s_callbacks, 0, sizeof(s_callbacks));
         if (callbacks) {
             s_callbacks = *callbacks;
@@ -2370,11 +2380,7 @@ STATIC OPERATE_RET __render_html(lv_obj_t *container, CONST CHAR_T *html,
     ctx.select_dom_idx = -1;
     ctx.textarea_dom_idx = -1;
     ctx.button_dom_idx = -1;
-    ctx.inline_buf = (CHAR_T *)tal_malloc(INLINE_BUF_MAX);
-    if (!ctx.inline_buf) {
-        if (processed) tal_free(processed);
-        return OPRT_MALLOC_FAILED;
-    }
+    ctx.inline_buf = s_inline_buf;
     ctx.inline_buf[0] = '\0';
 
     CONST CHAR_T *p = src;
@@ -2469,7 +2475,6 @@ STATIC OPERATE_RET __render_html(lv_obj_t *container, CONST CHAR_T *html,
         (VOID_T)__make_label(container, "[...] (page truncated)", &lv_font_unscii_8, COLOR_ITALIC);
     }
 
-    tal_free(ctx.inline_buf);
     if (ctx.style_buf) tal_free(ctx.style_buf);
     if (processed) tal_free(processed);
     return OPRT_OK;
