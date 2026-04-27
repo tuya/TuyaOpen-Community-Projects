@@ -3,8 +3,18 @@
  * @brief Raw-socket HTTP/1.0 client. Sends 'GET /path HTTP/1.0', handles Host,
  *        simple Content-Length or connection-close body delivery, and one-hop
  *        3xx Location redirect. Intentionally minimalist, to match the era.
- * @version 1.0.0
- * @date 2026-04-22
+ *
+ *        2026-04-27 (v1.2.0): reverted the non-blocking-connect path that was
+ *        introduced in v1.1.0. lwIP 2.1.2 vs the toolchain's <errno.h> have
+ *        different EINPROGRESS values on this build, which made the post-
+ *        connect errno-classification break for *every* host (info.cern.ch
+ *        too). The current implementation uses a plain blocking connect with
+ *        deterministic SO_RCV/SND timeouts and STA-IP source binding, plus
+ *        verbose PR_NOTICE logging at every stage so we can see exactly where
+ *        gate.yy.md:8090 fails on the device.
+ *
+ * @version 1.2.0
+ * @date    2026-04-27
  * @copyright Copyright (c) Tuya Inc.
  */
 #include "win95_http10.h"
@@ -16,8 +26,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* ---------------------------------------------------------------------------
+ * Macros
+ * --------------------------------------------------------------------------- */
 #define HTTP_RECV_CHUNK     1024
 #define HTTP_HEADER_MAX     4096
+
+/* Sentinel value reported when DNS resolution fails (so callers can
+ * distinguish DNS errors from connect failures without dragging in netdb.h). */
+#ifndef WIN95_ERR_DNS
+#define WIN95_ERR_DNS       (-9001)
+#endif
 
 /* ---------------------------------------------------------------------------
  * Thread-safe DNS resolver
@@ -25,12 +44,12 @@
  * lwip_gethostbyname() (used by tal_net_gethostbyname) stores its result in
  * static-storage locals (LWIP_DNS_API_HOSTENT_STORAGE=0 in lwipopts.h), so
  * a concurrent call from a Tuya SDK background thread overwrites the buffer
- * and returns a wrong IP → connect fails → OPRT_SOCK_CONN_ERR (-13).
+ * and returns a wrong IP -> connect fails -> OPRT_SOCK_CONN_ERR (-13).
  *
  * lwip_gethostbyname_r() writes into CALLER-provided buffers, making it
- * fully thread-safe.  The function is already compiled into the firmware via
+ * fully thread-safe. The function is already compiled into the firmware via
  * lwip/src/api/netdb.c; we forward-declare it here using a minimal equivalent
- * of struct hostent (same binary layout — 5 pointer/int fields, POSIX standard)
+ * of struct hostent (same binary layout - 5 pointer/int fields, POSIX standard)
  * to avoid pulling in the lwIP src/include path that is not exposed to app code.
  * --------------------------------------------------------------------------- */
 typedef struct {
@@ -45,28 +64,150 @@ extern int lwip_gethostbyname_r(const char *name,
                                  w95_hostent_t *ret, char *buf, UINT32_T buflen,
                                  w95_hostent_t **result, int *h_errnop);
 
+/**
+ * @brief Resolve hostname to IPv4 host-order address using a per-call buffer.
+ * @param[in]  host  DNS name (NUL-terminated)
+ * @param[out] addr  IPv4 address in host byte order
+ * @return OPRT_OK or OPRT_COM_ERROR
+ */
 OPERATE_RET win95_dns_resolve(CONST CHAR_T *host, TUYA_IP_ADDR_T *addr)
 {
+    if (host == NULL || host[0] == '\0' || addr == NULL) {
+        return OPRT_INVALID_PARM;
+    }
+
     w95_hostent_t  he_buf;
     CHAR_T         strbuf[384];
     w95_hostent_t *result = NULL;
     INT32_T        herr   = 0;
 
-    if (lwip_gethostbyname_r(host, &he_buf, strbuf, (UINT32_T)sizeof(strbuf),
-                              &result, &herr) != 0 ||
-        result == NULL ||
-        result->h_addr_list == NULL ||
-        result->h_addr_list[0] == NULL) {
-        PR_ERR("DNS failed for %s (h_errno=%d)", host, herr);
+    INT32_T rc = lwip_gethostbyname_r(host, &he_buf, strbuf,
+                                      (UINT32_T)sizeof(strbuf),
+                                      &result, &herr);
+    if (rc != 0 || result == NULL ||
+        result->h_addr_list == NULL || result->h_addr_list[0] == NULL) {
+        PR_ERR("[HTTP] DNS failed for %s (rc=%d, h_errno=%d)",
+               host, (int)rc, (int)herr);
         return OPRT_COM_ERROR;
     }
-    /* Network-byte-order → TUYA_IP_ADDR_T (host byte order), no ntohl needed:
-     * manually reconstruct so we don't need lwip/inet.h. */
+
     CONST UINT8_T *p = (CONST UINT8_T *)result->h_addr_list[0];
     *addr = ((TUYA_IP_ADDR_T)p[0] << 24) | ((TUYA_IP_ADDR_T)p[1] << 16) |
             ((TUYA_IP_ADDR_T)p[2] <<  8) |  (TUYA_IP_ADDR_T)p[3];
-    PR_DEBUG("DNS %s -> %u.%u.%u.%u", host, p[0], p[1], p[2], p[3]);
+    PR_NOTICE("[HTTP] DNS %s -> %u.%u.%u.%u",
+              host, p[0], p[1], p[2], p[3]);
     return OPRT_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * TCP open helper
+ * --------------------------------------------------------------------------- */
+/**
+ * @brief Best-effort bind the local socket to the WiFi station IP. If the AP
+ *        interface is up too, this prevents the kernel from accidentally
+ *        routing outbound TCP through the AP NIC (which has no internet).
+ *        Failures are logged but ignored.
+ */
+STATIC VOID_T __bind_station_ip(INT32_T fd)
+{
+    NW_IP_S ip_info;
+    memset(&ip_info, 0, sizeof(ip_info));
+    if (tal_wifi_get_ip(WF_STATION, &ip_info) != OPRT_OK ||
+        ip_info.ip[0] == '\0') {
+        PR_DEBUG("[HTTP] no STA ip, skip bind");
+        return;
+    }
+    TUYA_IP_ADDR_T bind_addr = tal_net_str2addr(ip_info.ip);
+    if (bind_addr == 0 || bind_addr == 0xFFFFFFFF) {
+        PR_DEBUG("[HTTP] STA ip parse failed: %s", ip_info.ip);
+        return;
+    }
+    if (tal_net_bind(fd, bind_addr, 0) != 0) {
+        PR_DEBUG("[HTTP] bind to STA ip %s failed", ip_info.ip);
+        return;
+    }
+    PR_DEBUG("[HTTP] bound to STA ip %s", ip_info.ip);
+}
+
+/**
+ * @brief Open a TCP socket and connect to host:port. Uses a *blocking*
+ *        connect (lwIP's only reliable mode on this SDK), with deterministic
+ *        SO_RCV/SND timeouts applied so subsequent send/recv don't hang.
+ *
+ *        Logs PR_NOTICE at every transition (DNS, socket-create, bind,
+ *        pre-connect, post-connect) and PR_ERR with the Tuya errno on any
+ *        failure so we can pinpoint where a slow / refused / RST'd host fails.
+ *
+ * @param[in]  host        DNS name
+ * @param[in]  port        TCP port
+ * @param[in]  timeout_ms  per-IO timeout (recv/send). Connect itself is
+ *                         bounded by lwIP's TCP_SYNMAXRTX retry budget.
+ * @param[out] err_out     populated on failure: WIN95_ERR_DNS for DNS
+ *                         errors, otherwise tal_net_get_errno() result.
+ *                         May be NULL.
+ * @return     fd >= 0 on success; -1 on failure (socket already closed).
+ */
+INT32_T win95_tcp_connect(CONST CHAR_T *host, UINT16_T port,
+                           UINT32_T timeout_ms, INT32_T *err_out)
+{
+    if (err_out) {
+        *err_out = 0;
+    }
+    if (host == NULL || host[0] == '\0' || timeout_ms == 0) {
+        if (err_out) {
+            *err_out = -1;
+        }
+        return -1;
+    }
+
+    PR_NOTICE("[HTTP] connect %s:%u (timeout=%ums)",
+              host, (UINT32_T)port, (UINT32_T)timeout_ms);
+
+    TUYA_IP_ADDR_T addr = 0;
+    if (win95_dns_resolve(host, &addr) != OPRT_OK || addr == 0) {
+        if (err_out) {
+            *err_out = WIN95_ERR_DNS;
+        }
+        return -1;
+    }
+
+    INT32_T fd = tal_net_socket_create(PROTOCOL_TCP);
+    if (fd < 0) {
+        TUYA_ERRNO en = tal_net_get_errno();
+        PR_ERR("[HTTP] socket() failed: fd=%d (errno=%d)", (int)fd, (int)en);
+        if (err_out) {
+            *err_out = (INT32_T)en;
+        }
+        return -1;
+    }
+    PR_DEBUG("[HTTP] socket fd=%d", (int)fd);
+
+    __bind_station_ip(fd);
+
+    /* Apply send/recv timeouts BEFORE connect so any delayed I/O on the
+     * established socket can't hang the worker thread. lwIP ignores these
+     * for connect itself, which is fine - blocking connect on lwIP returns
+     * on TCP_SYNMAXRTX retry exhaustion (~30s). The HTTP worker thread is
+     * dedicated and won't impact the UI. */
+    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_SEND);
+    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_RECV);
+
+    PR_DEBUG("[HTTP] calling tal_net_connect %s:%u ...",
+             host, (UINT32_T)port);
+    INT32_T rc = tal_net_connect(fd, addr, port);
+    if (rc != 0) {
+        TUYA_ERRNO en = tal_net_get_errno();
+        PR_ERR("[HTTP] connect %s:%u failed: rc=%d errno=%d",
+               host, (UINT32_T)port, (int)rc, (int)en);
+        if (err_out) {
+            *err_out = (INT32_T)en;
+        }
+        tal_net_close(fd);
+        return -1;
+    }
+    PR_NOTICE("[HTTP] connect ok %s:%u (fd=%d)",
+              host, (UINT32_T)port, (int)fd);
+    return fd;
 }
 
 /* ---------------------------------------------------------------------------
@@ -80,8 +221,12 @@ STATIC INT32_T __strncasecmp(CONST CHAR_T *a, CONST CHAR_T *b, UINT32_T n)
     for (UINT32_T i = 0; i < n; i++) {
         CHAR_T ca = a[i];
         CHAR_T cb = b[i];
-        if (ca >= 'A' && ca <= 'Z') ca = (CHAR_T)(ca + 32);
-        if (cb >= 'A' && cb <= 'Z') cb = (CHAR_T)(cb + 32);
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = (CHAR_T)(ca + 32);
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = (CHAR_T)(cb + 32);
+        }
         if (ca != cb) {
             return (UCHAR_T)ca - (UCHAR_T)cb;
         }
@@ -113,7 +258,6 @@ OPERATE_RET win95_http10_parse_url(CONST CHAR_T *url,
     if (strncmp(p, "http://", 7) == 0) {
         p += 7;
     } else if (strncmp(p, "https://", 8) == 0) {
-        /* We cannot do TLS - callers can fall back. */
         p += 8;
         *port_out = 443;
     }
@@ -163,11 +307,11 @@ OPERATE_RET win95_http10_parse_url(CONST CHAR_T *url,
 }
 
 /**
- * @brief Close socket if > 0.
+ * @brief Close socket if valid.
  */
 STATIC VOID_T __sock_close(INT32_T fd)
 {
-    if (fd > 0) {
+    if (fd >= 0) {
         tal_net_close(fd);
     }
 }
@@ -203,16 +347,21 @@ STATIC VOID_T __copy_trimmed(CHAR_T *dst, UINT32_T cap,
         start++;
     }
     while (len > start &&
-           (src[len - 1] == ' ' || src[len - 1] == '\t' || src[len - 1] == '\r')) {
+           (src[len - 1] == ' ' || src[len - 1] == '\t' ||
+            src[len - 1] == '\r')) {
         len--;
     }
-    if (cap == 0) return;
+    if (cap == 0) {
+        return;
+    }
     if (len <= start) {
         dst[0] = '\0';
         return;
     }
     UINT32_T n = len - start;
-    if (n >= cap) n = cap - 1;
+    if (n >= cap) {
+        n = cap - 1;
+    }
     memcpy(dst, src + start, n);
     dst[n] = '\0';
 }
@@ -227,7 +376,9 @@ STATIC VOID_T __parse_headers_block(CONST CHAR_T *hdr, UINT32_T hdr_len,
             i++;
         }
         UINT32_T line_end = i;
-        if (i < hdr_len && hdr[i] == '\n') i++;
+        if (i < hdr_len && hdr[i] == '\n') {
+            i++;
+        }
         if (line_end > line_start && hdr[line_end - 1] == '\r') {
             line_end--;
         }
@@ -249,7 +400,8 @@ STATIC VOID_T __parse_headers_block(CONST CHAR_T *hdr, UINT32_T hdr_len,
             __copy_trimmed(out->location, sizeof(out->location), val, val_len);
             out->has_location = (out->location[0] != '\0');
         } else if (key_len == 12 && __strncasecmp(line, "Content-Type", 12) == 0) {
-            __copy_trimmed(out->content_type, sizeof(out->content_type), val, val_len);
+            __copy_trimmed(out->content_type, sizeof(out->content_type),
+                           val, val_len);
             CHAR_T *semi = strchr(out->content_type, ';');
             if (semi) {
                 *semi = '\0';
@@ -283,16 +435,22 @@ STATIC INT32_T __memfind(CONST CHAR_T *hay, UINT32_T hay_len,
     return -1;
 }
 
-STATIC VOID_T __best_effort_bind_station_ip(INT32_T fd)
+/**
+ * @brief Send all bytes in [buf, buf+len). Returns 0 on success, <0 on error.
+ */
+STATIC INT32_T __send_all(INT32_T fd, CONST CHAR_T *buf, UINT32_T len)
 {
-    NW_IP_S ip_info;
-    memset(&ip_info, 0, sizeof(ip_info));
-    if (tal_wifi_get_ip(WF_STATION, &ip_info) == OPRT_OK && ip_info.ip[0] != '\0') {
-        TUYA_IP_ADDR_T bind_addr = tal_net_str2addr(ip_info.ip);
-        if (bind_addr != 0) {
-            tal_net_bind(fd, bind_addr, 0);
+    UINT32_T sent = 0;
+    while (sent < len) {
+        INT32_T n = tal_net_send(fd, buf + sent, len - sent);
+        if (n <= 0) {
+            PR_ERR("[HTTP10] send failed at %u/%u (errno=%d)",
+                   sent, len, (int)tal_net_get_errno());
+            return -1;
         }
+        sent += (UINT32_T)n;
     }
+    return 0;
 }
 
 /**
@@ -306,7 +464,6 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
     CHAR_T *buf = NULL;
     UINT32_T buf_cap = HTTP_RECV_CHUNK * 4;
     UINT32_T buf_len = 0;
-    OPERATE_RET rt = OPRT_OK;
 
     /* Preserve caller-provided pre-allocated buffer across the struct reset. */
     CHAR_T *const ext_buf = out->body_buf;
@@ -315,36 +472,23 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
     out->body_buf     = ext_buf;
     out->body_buf_cap = ext_cap;
 
-    TUYA_IP_ADDR_T addr = 0;
-    if (win95_dns_resolve(host, &addr) != OPRT_OK || addr == 0) {
-        return OPRT_COM_ERROR;
-    }
-
-    fd = tal_net_socket_create(PROTOCOL_TCP);
+    INT32_T conn_err = 0;
+    fd = win95_tcp_connect(host, port, timeout_ms, &conn_err);
     if (fd < 0) {
-        return OPRT_SOCK_ERR;
-    }
-
-    __best_effort_bind_station_ip(fd);
-    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_SEND);
-    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_RECV);
-
-    if (tal_net_connect(fd, addr, port) != 0) {
-        PR_ERR("connect failed: %s:%u", host, port);
-        __sock_close(fd);
+        PR_ERR("[HTTP10] tcp_connect %s:%u failed (err=%d)",
+               host, (UINT32_T)port, (int)conn_err);
         return OPRT_SOCK_CONN_ERR;
     }
 
     /* Build + send the request.
-     * Include port in Host for non-standard ports (RFC 7230 §5.4); some
-     * servers / reverse-proxies reject requests that omit it, returning an
-     * empty body which then triggers the HTTP/1.1 fallback and a DNS race. */
+     * Include port in Host for non-standard ports (RFC 7230 §5.4). */
     CHAR_T host_hdr[WIN95_HTTP_HOST_MAX + 8];
     if (port == 80) {
         strncpy(host_hdr, host, sizeof(host_hdr) - 1);
         host_hdr[sizeof(host_hdr) - 1] = '\0';
     } else {
-        snprintf(host_hdr, sizeof(host_hdr), "%s:%u", host, (UINT32_T)port);
+        snprintf(host_hdr, sizeof(host_hdr), "%s:%u",
+                 host, (UINT32_T)port);
     }
     CHAR_T req[512];
     INT32_T n = snprintf(req, sizeof(req),
@@ -359,10 +503,12 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
         __sock_close(fd);
         return OPRT_COM_ERROR;
     }
-    if (tal_net_send(fd, req, (UINT32_T)n) != n) {
+    if (__send_all(fd, req, (UINT32_T)n) != 0) {
         __sock_close(fd);
         return OPRT_SOCK_ERR;
     }
+    PR_DEBUG("[HTTP10] sent %d bytes of request to %s:%u",
+             (int)n, host, (UINT32_T)port);
 
     /* Use caller's pre-allocated buffer if provided; otherwise malloc. */
     if (ext_buf && ext_cap > 0) {
@@ -380,10 +526,9 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
     for (;;) {
         if (buf_len + HTTP_RECV_CHUNK + 1 > buf_cap) {
             if (ext_buf) {
-                break; /* fixed-size external buffer full */
+                break;
             }
             if (buf_cap >= WIN95_HTTP_BODY_MAX + HTTP_HEADER_MAX) {
-                /* Hit the hard cap - stop reading to protect PSRAM. */
                 break;
             }
             UINT32_T new_cap = buf_cap * 2;
@@ -411,8 +556,13 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
     buf[buf_len] = '\0';
     __sock_close(fd);
 
+    PR_NOTICE("[HTTP10] %s:%u -> %u bytes received",
+              host, (UINT32_T)port, buf_len);
+
     if (buf_len == 0) {
-        if (!ext_buf) tal_free(buf);
+        if (!ext_buf) {
+            tal_free(buf);
+        }
         return OPRT_COM_ERROR;
     }
 
@@ -430,7 +580,6 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
         }
     }
 
-    /* Parse status line (first line of header). */
     UINT16_T status_code = 0;
     __parse_status_line(buf, &status_code);
     out->status_code = status_code;
@@ -451,7 +600,7 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
 
     out->body = buf;
     out->body_len = body_len;
-    return rt;
+    return OPRT_OK;
 }
 
 OPERATE_RET win95_http10_get(CONST CHAR_T *host, UINT16_T port,
@@ -474,7 +623,6 @@ OPERATE_RET win95_http10_get(CONST CHAR_T *host, UINT16_T port,
         UINT16_T next_port = 80;
 
         if (out->location[0] == '/') {
-            /* same host */
             strncpy(next_host, host, sizeof(next_host) - 1);
             next_host[sizeof(next_host) - 1] = '\0';
             strncpy(next_path, out->location, sizeof(next_path) - 1);
@@ -485,18 +633,18 @@ OPERATE_RET win95_http10_get(CONST CHAR_T *host, UINT16_T port,
                     next_host, sizeof(next_host),
                     &next_port,
                     next_path, sizeof(next_path)) != OPRT_OK) {
-                return rt; /* give caller the 30x as-is */
+                return rt;
             }
-            /* If redirect is HTTPS, we can't follow. */
             if (next_port == 443) {
-                PR_WARN("Redirect to HTTPS not supported: %s", out->location);
+                PR_WARN("[HTTP10] HTTPS redirect not supported: %s",
+                        out->location);
                 return rt;
             }
         }
 
-        /* Free the redirect body, refetch. */
         win95_http10_free(out);
-        return __http10_get_once(next_host, next_port, next_path, timeout_ms, out);
+        return __http10_get_once(next_host, next_port, next_path,
+                                 timeout_ms, out);
     }
 
     return rt;
@@ -507,7 +655,6 @@ VOID_T win95_http10_free(WIN95_HTTP_RESP_T *resp)
     if (resp == NULL) {
         return;
     }
-    /* Only free body if it was dynamically allocated (body_buf == NULL). */
     if (resp->body && resp->body_buf == NULL) {
         tal_free(resp->body);
     }
@@ -517,5 +664,5 @@ VOID_T win95_http10_free(WIN95_HTTP_RESP_T *resp)
     resp->location[0] = '\0';
     resp->content_type[0] = '\0';
     resp->set_cookie_count = 0;
-    /* body_buf and body_buf_cap are NOT cleared — owned by the allocating caller. */
+    /* body_buf and body_buf_cap are NOT cleared - owned by the caller. */
 }

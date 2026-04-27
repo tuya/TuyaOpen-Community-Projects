@@ -4,6 +4,7 @@
  *        Certificate verification is disabled (IE4-era behaviour).
  */
 #include "win95_tls.h"
+#include "win95_http10.h"   /* win95_tcp_connect: non-blocking connect helper */
 #include "tuya_tls.h"
 #include "tal_network.h"
 #include "tal_api.h"
@@ -37,27 +38,20 @@ STATIC INT32_T __tls_recv_cb(VOID_T *ctx, UINT8_T *buf, size_t len)
  * --------------------------------------------------------------------------- */
 WIN95_TLS_T *win95_tls_connect(CONST CHAR_T *host, UINT16_T port, INT32_T timeout_ms)
 {
-    if (!host) return NULL;
-
-    /* Resolve hostname */
-    TUYA_IP_ADDR_T addr = 0;
-    if (tal_net_gethostbyname(host, &addr) != OPRT_OK || addr == 0) {
-        PR_ERR("TLS: DNS failed for %s", host);
+    if (!host) {
         return NULL;
     }
 
-    /* Open TCP socket */
-    INT32_T fd = tal_net_socket_create(PROTOCOL_TCP);
+    /* Use the unified non-blocking connect helper. It performs DNS via
+     * thread-safe lwip_gethostbyname_r, then non-blocking connect + select()
+     * with a real timeout, captures errno, and logs every transition. */
+    INT32_T conn_err = 0;
+    INT32_T fd = win95_tcp_connect(host, port,
+                                    (UINT32_T)(timeout_ms > 0 ? timeout_ms : 10000),
+                                    &conn_err);
     if (fd < 0) {
-        PR_ERR("TLS: socket_create failed");
-        return NULL;
-    }
-    tal_net_set_timeout(fd, timeout_ms, TRANS_SEND);
-    tal_net_set_timeout(fd, timeout_ms, TRANS_RECV);
-
-    if (tal_net_connect(fd, addr, port) != 0) {
-        PR_ERR("TLS: connect failed %s:%u", host, port);
-        tal_net_close(fd);
+        PR_ERR("[TLS] tcp_connect %s:%u failed (err=%d)",
+               host, (UINT32_T)port, (int)conn_err);
         return NULL;
     }
 

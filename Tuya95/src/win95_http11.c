@@ -164,18 +164,6 @@ STATIC VOID_T __io_close(IO_T *io)
     if (io->fd >= 0) { tal_net_close(io->fd); io->fd = -1; }
 }
 
-STATIC VOID_T __best_effort_bind_station_ip(INT32_T fd)
-{
-    NW_IP_S ip_info;
-    memset(&ip_info, 0, sizeof(ip_info));
-    if (tal_wifi_get_ip(WF_STATION, &ip_info) == OPRT_OK && ip_info.ip[0] != '\0') {
-        TUYA_IP_ADDR_T bind_addr = tal_net_str2addr(ip_info.ip);
-        if (bind_addr != 0) {
-            tal_net_bind(fd, bind_addr, 0);
-        }
-    }
-}
-
 /* ---------------------------------------------------------------------------
  * Core GET (one attempt, no redirect)
  * --------------------------------------------------------------------------- */
@@ -199,22 +187,16 @@ STATIC OPERATE_RET __http11_request_once(CONST CHAR_T *method,
     if (is_https) {
         io.tls = win95_tls_connect(host, port, (INT32_T)timeout_ms);
         if (!io.tls) {
-            PR_ERR("HTTP11: TLS connect failed %s:%u", host, port);
+            PR_ERR("[HTTP11] TLS connect failed %s:%u",
+                   host, (UINT32_T)port);
             return OPRT_COM_ERROR;
         }
     } else {
-        TUYA_IP_ADDR_T addr = 0;
-        if (win95_dns_resolve(host, &addr) != OPRT_OK || addr == 0) {
-            return OPRT_COM_ERROR;
-        }
-        io.fd = tal_net_socket_create(PROTOCOL_TCP);
-        if (io.fd < 0) return OPRT_SOCK_ERR;
-        __best_effort_bind_station_ip(io.fd);
-        tal_net_set_timeout(io.fd, (INT32_T)timeout_ms, TRANS_SEND);
-        tal_net_set_timeout(io.fd, (INT32_T)timeout_ms, TRANS_RECV);
-        if (tal_net_connect(io.fd, addr, port) != 0) {
-            PR_ERR("HTTP11: connect failed %s:%u", host, port);
-            __io_close(&io);
+        INT32_T conn_err = 0;
+        io.fd = win95_tcp_connect(host, port, timeout_ms, &conn_err);
+        if (io.fd < 0) {
+            PR_ERR("[HTTP11] tcp_connect %s:%u failed (err=%d)",
+                   host, (UINT32_T)port, (int)conn_err);
             return OPRT_SOCK_CONN_ERR;
         }
     }
