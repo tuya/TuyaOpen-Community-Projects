@@ -70,6 +70,24 @@ OPERATE_RET win95_http10_parse_url(CONST CHAR_T *url,
  */
 OPERATE_RET win95_dns_resolve(CONST CHAR_T *host, TUYA_IP_ADDR_T *addr);
 
+/**
+ * @brief Open a TCP socket and connect to host:port with non-blocking connect
+ *        + select() so a real, deterministic timeout (in ms) is applied.
+ *        Resolves DNS, sets SO_RCV/SND timeouts, then returns the connected fd.
+ *        Logs at every step; errno is captured into *err_out (may be NULL).
+ *
+ * @param[in]  host        DNS name (will be resolved internally)
+ * @param[in]  port        TCP port
+ * @param[in]  timeout_ms  Connect timeout in milliseconds
+ * @param[out] err_out     If non-NULL, filled with errno on failure
+ * @return     fd on success, -1 on any failure
+ *
+ * @note Replaces the historical "tal_net_connect (blocking, no timeout)"
+ *       pattern that caused -13 errors for hosts whose SYN-ACK either
+ *       arrived too late, or whose route was confused by AP/STA mode.
+ */
+INT32_T win95_tcp_connect(CONST CHAR_T *host, UINT16_T port,
+                           UINT32_T timeout_ms, INT32_T *err_out);
 
 #ifdef __cplusplus
 }
