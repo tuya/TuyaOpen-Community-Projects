@@ -71,20 +71,26 @@ OPERATE_RET win95_http10_parse_url(CONST CHAR_T *url,
 OPERATE_RET win95_dns_resolve(CONST CHAR_T *host, TUYA_IP_ADDR_T *addr);
 
 /**
- * @brief Open a TCP socket and connect to host:port with non-blocking connect
- *        + select() so a real, deterministic timeout (in ms) is applied.
- *        Resolves DNS, sets SO_RCV/SND timeouts, then returns the connected fd.
- *        Logs at every step; errno is captured into *err_out (may be NULL).
+ * @brief Open a TCP socket and (blocking) connect to host:port. Resolves DNS
+ *        with the thread-safe resolver, best-effort binds the source IP to
+ *        the WiFi station NIC (so the AP NIC isn't accidentally chosen when
+ *        running in dual mode), applies SO_RCV/SND timeouts, then returns
+ *        the connected fd. Logs at every step.
  *
- * @param[in]  host        DNS name (will be resolved internally)
+ * @param[in]  host        DNS name (resolved internally)
  * @param[in]  port        TCP port
- * @param[in]  timeout_ms  Connect timeout in milliseconds
- * @param[out] err_out     If non-NULL, filled with errno on failure
- * @return     fd on success, -1 on any failure
+ * @param[in]  timeout_ms  per-IO (recv/send) timeout in milliseconds
+ * @param[out] err_out     If non-NULL, populated on failure: WIN95_ERR_DNS
+ *                         (-9001) for DNS resolution failures, otherwise the
+ *                         tal_net_get_errno() value at the point of failure.
+ * @return     fd >= 0 on success, -1 on failure (socket already closed)
  *
- * @note Replaces the historical "tal_net_connect (blocking, no timeout)"
- *       pattern that caused -13 errors for hosts whose SYN-ACK either
- *       arrived too late, or whose route was confused by AP/STA mode.
+ * @note A non-blocking connect + select() implementation was tried and reverted:
+ *       lwIP's LWIP_PROVIDE_ERRNO produces values that don't always match the
+ *       toolchain's <errno.h>, which made post-connect EINPROGRESS recognition
+ *       unreliable. Using the SDK's blocking connect gives deterministic
+ *       behaviour for every host, at the cost of up to TCP_SYNMAXRTX retries
+ *       worth of latency for completely unreachable hosts.
  */
 INT32_T win95_tcp_connect(CONST CHAR_T *host, UINT16_T port,
                            UINT32_T timeout_ms, INT32_T *err_out);

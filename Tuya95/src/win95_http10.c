@@ -4,15 +4,16 @@
  *        simple Content-Length or connection-close body delivery, and one-hop
  *        3xx Location redirect. Intentionally minimalist, to match the era.
  *
- *        2026-04-27: rewrote the connect path. Old code called the blocking
- *        tal_net_connect() with no usable timeout (SO_*TIMEO doesn't apply to
- *        connect). For some hosts (e.g. http://gate.yy.md:8090/) lwIP's
- *        blocking connect would either return without a usable error code or
- *        wait long past the SDK's idle deadline, surfacing as -13
- *        (OPRT_SOCK_CONN_ERR). The new path uses non-blocking connect +
- *        tal_net_select(), captures errno, and logs every transition.
+ *        2026-04-27 (v1.2.0): reverted the non-blocking-connect path that was
+ *        introduced in v1.1.0. lwIP 2.1.2 vs the toolchain's <errno.h> have
+ *        different EINPROGRESS values on this build, which made the post-
+ *        connect errno-classification break for *every* host (info.cern.ch
+ *        too). The current implementation uses a plain blocking connect with
+ *        deterministic SO_RCV/SND timeouts and STA-IP source binding, plus
+ *        verbose PR_NOTICE logging at every stage so we can see exactly where
+ *        gate.yy.md:8090 fails on the device.
  *
- * @version 1.1.0
+ * @version 1.2.0
  * @date    2026-04-27
  * @copyright Copyright (c) Tuya Inc.
  */
@@ -24,7 +25,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
 
 /* ---------------------------------------------------------------------------
  * Macros
@@ -32,20 +32,10 @@
 #define HTTP_RECV_CHUNK     1024
 #define HTTP_HEADER_MAX     4096
 
-/* lwIP socket-level option constants. We can't include <lwip/sockets.h>
- * because it isn't on the app include path; the values below come straight
- * from lwip-2.1.2/src/include/lwip/sockets.h and are stable. */
-#ifndef WIN95_LWIP_SOL_SOCKET
-#define WIN95_LWIP_SOL_SOCKET   0xfff
-#endif
-#ifndef WIN95_LWIP_SO_ERROR
-#define WIN95_LWIP_SO_ERROR     0x1007
-#endif
-
-/* Sentinel errno reported when DNS resolution fails (so callers can
- * distinguish DNS errors from connect timeouts without dragging in netdb.h). */
-#ifndef EAI_FAIL_PLACEHOLDER
-#define EAI_FAIL_PLACEHOLDER  (-9001)
+/* Sentinel value reported when DNS resolution fails (so callers can
+ * distinguish DNS errors from connect failures without dragging in netdb.h). */
+#ifndef WIN95_ERR_DNS
+#define WIN95_ERR_DNS       (-9001)
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -57,7 +47,7 @@
  * and returns a wrong IP -> connect fails -> OPRT_SOCK_CONN_ERR (-13).
  *
  * lwip_gethostbyname_r() writes into CALLER-provided buffers, making it
- * fully thread-safe.  The function is already compiled into the firmware via
+ * fully thread-safe. The function is already compiled into the firmware via
  * lwip/src/api/netdb.c; we forward-declare it here using a minimal equivalent
  * of struct hostent (same binary layout - 5 pointer/int fields, POSIX standard)
  * to avoid pulling in the lwIP src/include path that is not exposed to app code.
@@ -110,7 +100,7 @@ OPERATE_RET win95_dns_resolve(CONST CHAR_T *host, TUYA_IP_ADDR_T *addr)
 }
 
 /* ---------------------------------------------------------------------------
- * Non-blocking-connect TCP open helper
+ * TCP open helper
  * --------------------------------------------------------------------------- */
 /**
  * @brief Best-effort bind the local socket to the WiFi station IP. If the AP
@@ -128,52 +118,34 @@ STATIC VOID_T __bind_station_ip(INT32_T fd)
         return;
     }
     TUYA_IP_ADDR_T bind_addr = tal_net_str2addr(ip_info.ip);
-    if (bind_addr == 0) {
+    if (bind_addr == 0 || bind_addr == 0xFFFFFFFF) {
         PR_DEBUG("[HTTP] STA ip parse failed: %s", ip_info.ip);
         return;
     }
     if (tal_net_bind(fd, bind_addr, 0) != 0) {
-        PR_DEBUG("[HTTP] bind to STA ip %s failed (errno=%d)",
-                 ip_info.ip, (int)errno);
+        PR_DEBUG("[HTTP] bind to STA ip %s failed", ip_info.ip);
         return;
     }
     PR_DEBUG("[HTTP] bound to STA ip %s", ip_info.ip);
 }
 
 /**
- * @brief Wait until fd is writable (i.e. connect completed) for at most
- *        timeout_ms. Returns 1=ready, 0=timeout, -1=error.
- */
-STATIC INT32_T __wait_writable(INT32_T fd, UINT32_T timeout_ms)
-{
-    TUYA_FD_SET_T wfds, efds;
-    TAL_FD_ZERO(&wfds);
-    TAL_FD_ZERO(&efds);
-    TAL_FD_SET(fd, &wfds);
-    TAL_FD_SET(fd, &efds);
-    INT32_T rc = tal_net_select(fd + 1, NULL, &wfds, &efds, timeout_ms);
-    if (rc < 0) {
-        return -1;
-    }
-    if (rc == 0) {
-        return 0;
-    }
-    if (TAL_FD_ISSET(fd, &efds)) {
-        return -1;
-    }
-    if (TAL_FD_ISSET(fd, &wfds)) {
-        return 1;
-    }
-    return -1;
-}
-
-/**
- * @brief Open a TCP socket and connect to host:port with deterministic timeout.
+ * @brief Open a TCP socket and connect to host:port. Uses a *blocking*
+ *        connect (lwIP's only reliable mode on this SDK), with deterministic
+ *        SO_RCV/SND timeouts applied so subsequent send/recv don't hang.
+ *
+ *        Logs PR_NOTICE at every transition (DNS, socket-create, bind,
+ *        pre-connect, post-connect) and PR_ERR with the Tuya errno on any
+ *        failure so we can pinpoint where a slow / refused / RST'd host fails.
+ *
  * @param[in]  host        DNS name
  * @param[in]  port        TCP port
- * @param[in]  timeout_ms  per-stage timeout (DNS, connect, send, recv)
- * @param[out] err_out     errno captured at the failing stage (may be NULL)
- * @return fd on success, -1 on failure (and the socket is closed)
+ * @param[in]  timeout_ms  per-IO timeout (recv/send). Connect itself is
+ *                         bounded by lwIP's TCP_SYNMAXRTX retry budget.
+ * @param[out] err_out     populated on failure: WIN95_ERR_DNS for DNS
+ *                         errors, otherwise tal_net_get_errno() result.
+ *                         May be NULL.
+ * @return     fd >= 0 on success; -1 on failure (socket already closed).
  */
 INT32_T win95_tcp_connect(CONST CHAR_T *host, UINT16_T port,
                            UINT32_T timeout_ms, INT32_T *err_out)
@@ -183,7 +155,7 @@ INT32_T win95_tcp_connect(CONST CHAR_T *host, UINT16_T port,
     }
     if (host == NULL || host[0] == '\0' || timeout_ms == 0) {
         if (err_out) {
-            *err_out = EINVAL;
+            *err_out = -1;
         }
         return -1;
     }
@@ -194,16 +166,17 @@ INT32_T win95_tcp_connect(CONST CHAR_T *host, UINT16_T port,
     TUYA_IP_ADDR_T addr = 0;
     if (win95_dns_resolve(host, &addr) != OPRT_OK || addr == 0) {
         if (err_out) {
-            *err_out = EAI_FAIL_PLACEHOLDER;
+            *err_out = WIN95_ERR_DNS;
         }
         return -1;
     }
 
     INT32_T fd = tal_net_socket_create(PROTOCOL_TCP);
     if (fd < 0) {
-        PR_ERR("[HTTP] socket() failed: %d (errno=%d)", (int)fd, (int)errno);
+        TUYA_ERRNO en = tal_net_get_errno();
+        PR_ERR("[HTTP] socket() failed: fd=%d (errno=%d)", (int)fd, (int)en);
         if (err_out) {
-            *err_out = errno;
+            *err_out = (INT32_T)en;
         }
         return -1;
     }
@@ -211,101 +184,29 @@ INT32_T win95_tcp_connect(CONST CHAR_T *host, UINT16_T port,
 
     __bind_station_ip(fd);
 
-    /* Switch to non-blocking BEFORE connect so we can apply a real timeout. */
-    if (tal_net_set_block(fd, FALSE) != OPRT_OK) {
-        PR_WARN("[HTTP] set non-blocking failed (errno=%d) - falling back",
-                (int)errno);
-        /* If we can't go non-blocking, still attempt a blocking connect. */
-        if (tal_net_connect(fd, addr, port) != 0) {
-            PR_ERR("[HTTP] blocking connect %s:%u failed (errno=%d)",
-                   host, (UINT32_T)port, (int)errno);
-            if (err_out) {
-                *err_out = errno;
-            }
-            tal_net_close(fd);
-            return -1;
-        }
-        PR_NOTICE("[HTTP] blocking connect ok %s:%u (fd=%d)",
-                  host, (UINT32_T)port, (int)fd);
-        goto connected;
-    }
+    /* Apply send/recv timeouts BEFORE connect so any delayed I/O on the
+     * established socket can't hang the worker thread. lwIP ignores these
+     * for connect itself, which is fine - blocking connect on lwIP returns
+     * on TCP_SYNMAXRTX retry exhaustion (~30s). The HTTP worker thread is
+     * dedicated and won't impact the UI. */
+    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_SEND);
+    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_RECV);
 
+    PR_DEBUG("[HTTP] calling tal_net_connect %s:%u ...",
+             host, (UINT32_T)port);
     INT32_T rc = tal_net_connect(fd, addr, port);
-    if (rc == 0) {
-        PR_NOTICE("[HTTP] connect immediate-ok %s:%u (fd=%d)",
-                  host, (UINT32_T)port, (int)fd);
-        goto connected;
-    }
-
-    INT32_T saved_errno = errno;
-    if (saved_errno != EINPROGRESS && saved_errno != EWOULDBLOCK &&
-        saved_errno != EAGAIN) {
-        PR_ERR("[HTTP] connect %s:%u syscall failed: rc=%d errno=%d",
-               host, (UINT32_T)port, (int)rc, (int)saved_errno);
+    if (rc != 0) {
+        TUYA_ERRNO en = tal_net_get_errno();
+        PR_ERR("[HTTP] connect %s:%u failed: rc=%d errno=%d",
+               host, (UINT32_T)port, (int)rc, (int)en);
         if (err_out) {
-            *err_out = saved_errno;
-        }
-        tal_net_close(fd);
-        return -1;
-    }
-
-    PR_DEBUG("[HTTP] connect in-progress, waiting up to %ums", timeout_ms);
-    INT32_T sel = __wait_writable(fd, timeout_ms);
-    if (sel == 0) {
-        PR_ERR("[HTTP] connect %s:%u timeout after %ums",
-               host, (UINT32_T)port, timeout_ms);
-        if (err_out) {
-            *err_out = ETIMEDOUT;
-        }
-        tal_net_close(fd);
-        return -1;
-    }
-    if (sel < 0) {
-        PR_ERR("[HTTP] connect %s:%u select failed (errno=%d)",
-               host, (UINT32_T)port, (int)errno);
-        if (err_out) {
-            *err_out = errno;
-        }
-        tal_net_close(fd);
-        return -1;
-    }
-
-    /* Socket is writable; verify connect actually succeeded. */
-    int sock_err = 0;
-    int sock_err_len = sizeof(sock_err);
-    INT32_T gso = tal_net_getsockopt(fd, WIN95_LWIP_SOL_SOCKET,
-                                     WIN95_LWIP_SO_ERROR,
-                                     &sock_err, &sock_err_len);
-    if (gso != 0) {
-        PR_ERR("[HTTP] getsockopt(SO_ERROR) failed: %d (errno=%d)",
-               (int)gso, (int)errno);
-        if (err_out) {
-            *err_out = errno;
-        }
-        tal_net_close(fd);
-        return -1;
-    }
-    if (sock_err != 0) {
-        PR_ERR("[HTTP] connect %s:%u failed: SO_ERROR=%d",
-               host, (UINT32_T)port, sock_err);
-        if (err_out) {
-            *err_out = sock_err;
+            *err_out = (INT32_T)en;
         }
         tal_net_close(fd);
         return -1;
     }
     PR_NOTICE("[HTTP] connect ok %s:%u (fd=%d)",
               host, (UINT32_T)port, (int)fd);
-
-connected:
-    /* Restore blocking mode + apply per-IO timeouts so subsequent send/recv
-     * have deterministic behavior. */
-    if (tal_net_set_block(fd, TRUE) != OPRT_OK) {
-        PR_DEBUG("[HTTP] restore blocking failed (errno=%d), keeping NB",
-                 (int)errno);
-    }
-    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_SEND);
-    tal_net_set_timeout(fd, (INT32_T)timeout_ms, TRANS_RECV);
     return fd;
 }
 
@@ -543,8 +444,8 @@ STATIC INT32_T __send_all(INT32_T fd, CONST CHAR_T *buf, UINT32_T len)
     while (sent < len) {
         INT32_T n = tal_net_send(fd, buf + sent, len - sent);
         if (n <= 0) {
-            PR_ERR("[HTTP] send failed at %u/%u (errno=%d)",
-                   sent, len, (int)errno);
+            PR_ERR("[HTTP10] send failed at %u/%u (errno=%d)",
+                   sent, len, (int)tal_net_get_errno());
             return -1;
         }
         sent += (UINT32_T)n;
@@ -606,7 +507,8 @@ STATIC OPERATE_RET __http10_get_once(CONST CHAR_T *host, UINT16_T port,
         __sock_close(fd);
         return OPRT_SOCK_ERR;
     }
-    PR_DEBUG("[HTTP10] sent %d bytes of request", (int)n);
+    PR_DEBUG("[HTTP10] sent %d bytes of request to %s:%u",
+             (int)n, host, (UINT32_T)port);
 
     /* Use caller's pre-allocated buffer if provided; otherwise malloc. */
     if (ext_buf && ext_cap > 0) {
