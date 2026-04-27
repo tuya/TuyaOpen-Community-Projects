@@ -4,6 +4,7 @@
  *        Short tap = reveal, long press = flag, BFS flood-fill for empty cells.
  */
 #include "win95_mine.h"
+#include "win95_chrome.h"
 #include "tal_api.h"
 #include "lv_vendor.h"
 
@@ -151,11 +152,9 @@ STATIC VOID_T __mine_update_cell_ui(MINE_CTX_T *ctx, INT32_T r, INT32_T c)
     lv_obj_t *lbl = lv_obj_get_child(btn, 0);
 
     if (!cell->revealed) {
-        /* Win95 raised look: white highlight on top/left; dark bg shows at bottom/right */
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0xC0C0C0), 0);
-        lv_obj_set_style_border_color(btn, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_border_side(btn, LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_LEFT, 0);
-        lv_obj_set_style_border_width(btn, 2, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(WIN95_COLOR_TASKBAR), 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        win95_chrome_raised(btn);
         if (cell->flagged) {
             lv_label_set_text(lbl, "P");
             lv_obj_set_style_text_color(lbl, lv_color_hex(0xFF0000), 0);
@@ -166,10 +165,11 @@ STATIC VOID_T __mine_update_cell_ui(MINE_CTX_T *ctx, INT32_T r, INT32_T c)
         return;
     }
 
-    /* Revealed: flat / sunken */
+    lv_obj_set_style_radius(btn, 0, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
     lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_border_color(btn, lv_color_hex(0x808080), 0);
-    lv_obj_set_style_border_side(btn, LV_BORDER_SIDE_FULL, 0);
+    lv_obj_set_style_border_side(btn, LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_LEFT, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(WIN95_COLOR_SHADOW), 0);
 
     if (cell->mine) {
         lv_obj_set_style_bg_color(btn, lv_color_hex(0xFF4444), 0);
@@ -177,13 +177,13 @@ STATIC VOID_T __mine_update_cell_ui(MINE_CTX_T *ctx, INT32_T r, INT32_T c)
         lv_obj_set_style_text_color(lbl, lv_color_hex(0x000000), 0);
         lv_obj_set_style_text_font(lbl, &lv_font_unscii_16, 0);
     } else if (cell->adj > 0) {
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0xBEBEBE), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(WIN95_COLOR_TASKBAR), 0);
         CHAR_T s[4]; snprintf(s, sizeof(s), "%d", (INT32_T)cell->adj);
         lv_label_set_text(lbl, s);
         lv_obj_set_style_text_color(lbl, lv_color_hex(s_num_clr[cell->adj]), 0);
         lv_obj_set_style_text_font(lbl, &lv_font_unscii_16, 0);
     } else {
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0xBEBEBE), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(WIN95_COLOR_TASKBAR), 0);
         lv_label_set_text(lbl, "");
     }
 }
@@ -360,7 +360,7 @@ VOID_T win95_mine_open(lv_obj_t *parent)
     ctx->first_reveal = TRUE;
     s_mine = ctx;
 
-    /* ---- Full-screen window ---- */
+    /* ---- Full-screen window with raised outer bevel ---- */
     lv_obj_t *par = parent ? parent : lv_layer_top();
     lv_obj_t *win = lv_obj_create(par);
     lv_obj_remove_style_all(win);
@@ -369,6 +369,7 @@ VOID_T win95_mine_open(lv_obj_t *parent)
     lv_obj_set_style_bg_color(win, lv_color_hex(WIN95_COLOR_WINDOW), 0);
     lv_obj_set_style_bg_opa(win, LV_OPA_COVER, 0);
     lv_obj_clear_flag(win, LV_OBJ_FLAG_SCROLLABLE);
+    win95_chrome_raised(win);
     ctx->screen = win;
 
     /* ---- Title bar ---- */
@@ -390,25 +391,21 @@ VOID_T win95_mine_open(lv_obj_t *parent)
     lv_obj_set_size(xb, 16, 14);
     lv_obj_align(xb, LV_ALIGN_RIGHT_MID, -2, 0);
     lv_obj_set_style_bg_color(xb, lv_color_hex(WIN95_COLOR_WINDOW), 0);
-    lv_obj_set_style_radius(xb, 0, 0);
-    lv_obj_set_style_border_width(xb, 1, 0);
-    lv_obj_set_style_pad_all(xb, 0, 0);
+    win95_chrome_button(xb);
     lv_obj_t *xl = lv_label_create(xb);
     lv_obj_set_style_text_font(xl, &lv_font_unscii_8, 0);
     lv_label_set_text(xl, "X");
     lv_obj_center(xl);
     lv_obj_add_event_cb(xb, __close_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* ---- Status row ---- */
+    /* ---- Status row (sunken bevel, classic Win95 minesweeper top bar) ---- */
     lv_obj_t *sr = lv_obj_create(win);
     lv_obj_remove_style_all(sr);
     lv_obj_set_size(sr, MINE_W - 8, MINE_STATUS_H);
     lv_obj_set_pos(sr, 4, MINE_TITLE_H + 2);
     lv_obj_set_style_bg_color(sr, lv_color_hex(WIN95_COLOR_WINDOW), 0);
     lv_obj_set_style_bg_opa(sr, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(sr, lv_color_hex(WIN95_COLOR_SHADOW), 0);
-    lv_obj_set_style_border_width(sr, 1, 0);
-    lv_obj_set_style_radius(sr, 0, 0);
+    win95_chrome_inset(sr);
     lv_obj_clear_flag(sr, LV_OBJ_FLAG_SCROLLABLE);
 
     /* Mine count label */
@@ -421,14 +418,12 @@ VOID_T win95_mine_open(lv_obj_t *parent)
     lv_label_set_text(ctx->mine_lbl, "010");
     lv_obj_align(ctx->mine_lbl, LV_ALIGN_LEFT_MID, 4, 0);
 
-    /* Smiley/face button */
+    /* Smiley/face button (raised Win95 button) */
     ctx->face_btn = lv_btn_create(sr);
     lv_obj_set_size(ctx->face_btn, 24, 22);
     lv_obj_align(ctx->face_btn, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(ctx->face_btn, lv_color_hex(WIN95_COLOR_WINDOW), 0);
-    lv_obj_set_style_radius(ctx->face_btn, 0, 0);
-    lv_obj_set_style_border_width(ctx->face_btn, 1, 0);
-    lv_obj_set_style_pad_all(ctx->face_btn, 0, 0);
+    win95_chrome_button(ctx->face_btn);
     lv_obj_t *fl = lv_label_create(ctx->face_btn);
     lv_obj_set_style_text_font(fl, &lv_font_unscii_8, 0);
     lv_label_set_text(fl, ":)");
@@ -445,29 +440,27 @@ VOID_T win95_mine_open(lv_obj_t *parent)
     lv_label_set_text(ctx->time_lbl, "000");
     lv_obj_align(ctx->time_lbl, LV_ALIGN_RIGHT_MID, -4, 0);
 
-    /* ---- Grid container: dark background shows as cell shadow gaps ---- */
+    /* ---- Grid container: sunken inset frames the playing field ---- */
     lv_obj_t *grid_cont = lv_obj_create(win);
     lv_obj_remove_style_all(grid_cont);
-    lv_obj_set_size(grid_cont, MINE_GRID_W, MINE_GRID_H);
-    lv_obj_set_pos(grid_cont, MINE_GRID_X, MINE_GRID_Y);
-    lv_obj_set_style_bg_color(grid_cont, lv_color_hex(0x808080), 0);
+    lv_obj_set_size(grid_cont, MINE_GRID_W + 4, MINE_GRID_H + 4);
+    lv_obj_set_pos(grid_cont, MINE_GRID_X - 2, MINE_GRID_Y - 2);
+    lv_obj_set_style_bg_color(grid_cont, lv_color_hex(WIN95_COLOR_TASKBAR), 0);
     lv_obj_set_style_bg_opa(grid_cont, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(grid_cont, 0, 0);
+    win95_chrome_inset(grid_cont);
     lv_obj_clear_flag(grid_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     /* ---- Cells ---- */
     for (INT32_T r = 0; r < MINE_ROWS; r++) {
         for (INT32_T c = 0; c < MINE_COLS; c++) {
             lv_obj_t *btn = lv_obj_create(grid_cont);
-            lv_obj_set_size(btn, MINE_CELL_SZ - 1, MINE_CELL_SZ - 1);
-            lv_obj_set_pos(btn, c * MINE_CELL_SZ, r * MINE_CELL_SZ);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0xC0C0C0), 0);
+            lv_obj_remove_style_all(btn);
+            lv_obj_set_size(btn, MINE_CELL_SZ, MINE_CELL_SZ);
+            lv_obj_set_pos(btn, c * MINE_CELL_SZ + 2, r * MINE_CELL_SZ + 2);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(WIN95_COLOR_TASKBAR), 0);
             lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-            lv_obj_set_style_radius(btn, 0, 0);
             lv_obj_set_style_pad_all(btn, 0, 0);
-            lv_obj_set_style_border_color(btn, lv_color_hex(0xFFFFFF), 0);
-            lv_obj_set_style_border_side(btn, LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_LEFT, 0);
-            lv_obj_set_style_border_width(btn, 2, 0);
+            win95_chrome_raised(btn);
             lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
 
             lv_obj_t *lbl = lv_label_create(btn);

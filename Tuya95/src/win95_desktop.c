@@ -62,8 +62,7 @@ typedef struct {
     lv_obj_t *start_menu;
     lv_obj_t *clock_lbl;
     lv_obj_t *active_win;
-    lv_obj_t *net_ico1;
-    lv_obj_t *net_ico2;
+    lv_obj_t *net_ico;
     lv_timer_t *clock_tmr;
     BOOL_T menu_open;
     BOOL_T ntp_requested;
@@ -707,11 +706,11 @@ STATIC VOID_T __clock_cb(lv_timer_t *timer)
 
     BOOL_T connected = (app->wifi_state == WIFI_ST_CONNECTED) ||
                        (app->pair_state == PAIR_ST_MQTT_CONNECTED);
-    if (s_w95.net_ico1) {
+    if (s_w95.net_ico) {
         if (connected) {
-            lv_obj_clear_flag(s_w95.net_ico1, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_w95.net_ico, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_add_flag(s_w95.net_ico1, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_w95.net_ico, LV_OBJ_FLAG_HIDDEN);
         }
     }
 
@@ -722,19 +721,31 @@ STATIC VOID_T __clock_cb(lv_timer_t *timer)
 }
 
 /**
- * @brief Draw a mini monitor icon in the taskbar tray
+ * @brief Draw the network tray icon (single 12x12 ARGB sprite that already
+ *        depicts a pair of connected PCs)
  * @param[in] parent tray container
- * @param[in] x x position
- * @param[in] y y position
- * @param[in] color screen color
- * @return monitor object
+ * @param[in] x x position inside the tray
+ * @param[in] y y position inside the tray
+ * @return image object
+ * @note We force the image bounding box to match the sprite's natural size and
+ *       pin alignment to CENTER. This is defensive against any inherited
+ *       container style that might enable tiling/stretching and trigger the
+ *       "two-icons-in-one" optical illusion seen on the device.
  */
 STATIC lv_obj_t *__mini_monitor(lv_obj_t *parent, INT32_T x, INT32_T y)
 {
     lv_obj_t *mon = lv_image_create(parent);
+    lv_obj_remove_style_all(mon);
     lv_image_set_src(mon, &g_win95_icon_traynet);
+    lv_image_set_inner_align(mon, LV_IMAGE_ALIGN_CENTER);
+    lv_image_set_scale(mon, LV_SCALE_NONE);
     lv_obj_set_size(mon, g_win95_icon_traynet.header.w, g_win95_icon_traynet.header.h);
     lv_obj_set_pos(mon, x, y);
+    lv_obj_set_style_bg_opa(mon, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mon, 0, 0);
+    lv_obj_set_style_outline_width(mon, 0, 0);
+    lv_obj_set_style_shadow_width(mon, 0, 0);
+    lv_obj_set_style_pad_all(mon, 0, 0);
     lv_obj_clear_flag(mon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(mon, LV_OBJ_FLAG_SCROLLABLE);
     return mon;
@@ -784,10 +795,9 @@ STATIC VOID_T __build_taskbar(VOID_T)
     lv_obj_clear_flag(tray, LV_OBJ_FLAG_SCROLLABLE);
     __sunken(tray);
 
-    /* Network indicator */
-    s_w95.net_ico1 = __mini_monitor(tray, 2, 2);
-    s_w95.net_ico2 = NULL;
-    lv_obj_add_flag(s_w95.net_ico1, LV_OBJ_FLAG_HIDDEN);
+    /* Network indicator (single sprite, image already depicts 2 PCs) */
+    s_w95.net_ico = __mini_monitor(tray, 2, 2);
+    lv_obj_add_flag(s_w95.net_ico, LV_OBJ_FLAG_HIDDEN);
 
     /* Clock label */
     s_w95.clock_lbl = lv_label_create(tray);
@@ -914,12 +924,12 @@ VOID_T win95_desktop_init(VOID_T)
  */
 VOID_T win95_taskbar_set_net(BOOL_T connected)
 {
-    if (s_w95.net_ico1 == NULL) {
+    if (s_w95.net_ico == NULL) {
         return;
     }
     if (connected) {
-        lv_obj_clear_flag(s_w95.net_ico1, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_w95.net_ico, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lv_obj_add_flag(s_w95.net_ico1, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_w95.net_ico, LV_OBJ_FLAG_HIDDEN);
     }
 }
