@@ -10,7 +10,7 @@ A curated collection of open source projects under TuyaOpen, dedicated to buildi
 | Tuya T5 Pixel | 32x32 Pixel Art LED NeoPixels | AI-Agent, IoT, Open-Hardware | [Repo](https://github.com/tuya/TuyaOpen/tree/master/apps/tuya_t5_pixel) | [TuyaOpen](https://github.com/tuya) | EN/CN |
 | Tuya T5 e-Paper Album | A colorful ink photo album based on TuyaOpen | AI-Agent, IoT, Open-Hardware, E-INK, Local-Server | [e-Paper-Album](https://github.com/HonestQiao/e-Paper-Album/) | [HonestQiao](https://github.com/HonestQiao) | CN |
 | Tuya95 | Win95-like emulator program | Retro, IoT, Open-Hardware | [Tuya95](https://github.com/YuYanDev/Tuya95) | [YuYanDev](https://github.com/YuYanDev) | EN |
-| Tuya T5 OBD Meter | A car OBD instrument panel | Car, BLE, Open-Hardware | [Tuya95](https://github.com/YuYanDev/T5OBD) | [YuYanDev](https://github.com/YuYanDev) | EN |
+| Tuya T5 OBD Meter | A car OBD instrument panel | Car, BLE, Open-Hardware | [T5OBD](https://github.com/YuYanDev/T5OBD) | [YuYanDev](https://github.com/YuYanDev) | EN |
 
 ## Contribution Guidelines
 
